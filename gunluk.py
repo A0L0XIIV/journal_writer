@@ -6,7 +6,7 @@ from enum import IntEnum
 from datetime import datetime, timedelta
 from tabulate import tabulate
 
-_CONFIG_FILE_PATH = 'B:\\\\gunluk\\'
+_CONFIG_FILE_PATH = 'B:\\\\Projects\\journal_writer'
 _CONFIG_FILE_NAME = 'config.ini'
 _CONFIG_FILE = os.path.join(os.getcwd(), f'{_CONFIG_FILE_PATH}/{_CONFIG_FILE_NAME}')
 _CONFIG_SECTION = 'postgresql'
@@ -99,9 +99,7 @@ def insert_entertainment(conn):
             break
     name = input('Name: ')
     url = input('Image URL: ')
-    sql = """
-    INSERT INTO entertainments (type, name, image_url) VALUES ({0}, '{1}', '{2}');
-    """.format(_type, name, url)
+    sql = f"INSERT INTO entertainments (type, name, image_url) VALUES ({_type}, '{name}', '{url}');"
     query(conn, sql, fetch=False)
 
 def get_entertainment(conn) -> tuple[str, int]:
