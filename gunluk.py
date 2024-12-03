@@ -1,6 +1,7 @@
 import os
 import psycopg2
 import re
+import time
 from configparser import ConfigParser
 from enum import IntEnum
 from datetime import datetime, timedelta
@@ -108,7 +109,7 @@ def get_entertainment(conn) -> tuple[str, int]:
     entertainments = query(conn, sql)
     if not entertainments or len(entertainments) == 0:
         print('Could not find any entertainments with that name')
-        return
+        return None, None
 
     # Print option and return the selected ones ID
     print('0- Nope/Exit')
@@ -122,7 +123,7 @@ def get_entertainment(conn) -> tuple[str, int]:
         if selected < 0 or selected > len(entertainments):
             print('Invalid selection, try again')
         elif selected == '0':
-            break
+            return None, None
         else:
             # ID is the first item of the query (id, name)
             selected_index = int(selected) - 1
@@ -156,17 +157,17 @@ def insert_gunluk(conn, is_custom_date = False):
     while True:
         _temp_journal += input('Journal: ')
         # Ask if it's completed or accidently pressed the Enter button
-        if input('Is it done? (y, n): ') == 'y':
+        if yes_no_question('Is it done?'):
             # Query needs double quote --> ''
             journal = _temp_journal.replace('\'', '\'\'')
             break
-        elif input('Reset the written text? (y, n): ') == 'y':
+        elif yes_no_question('Reset the written text?'):
             _temp_journal = ''
 
-
+    # Insert daily entertainments
     daily_entertainments = []
     while True:
-        if input('Add entertainment? (y, n): ').lower() == 'n':
+        if not yes_no_question('Add entertainment?'):
             break
         e_id, e_type = get_entertainment(conn=conn)
         if e_id:
@@ -186,7 +187,7 @@ def insert_gunluk(conn, is_custom_date = False):
                     # It's a list of tuple: [('S1E10-S1E10',)]
                     last_duration = last_duration[0][0]
                     # If the season is the same, just get the last episode number
-                    if input("Same season (y, n)?") == 'y':
+                    if yes_no_question('Same season?'):
                         initial, last = last_duration.split('-')
                         # Fint the initial and last 'E', and get the numbers index (+1)
                         initial_episode_index = initial.rfind('E') + 1
@@ -224,7 +225,7 @@ def insert_gunluk(conn, is_custom_date = False):
         if 0 <= current_hour and current_hour < 4:
             yesterday = datetime.now() - timedelta(days=1)
             _temp_date = datetime.strftime(yesterday, '%Y-%m-%d') + ' 23:59:59.000000-04:00'
-            if input('Use yesterday {} as date? (y, n): '.format(_temp_date)) == 'y':
+            if yes_no_question(f'Use yesterday {_temp_date} as date?'):
                 # It's a text, requires ''
                 query_date = "'" + _temp_date + "'"
 
@@ -295,13 +296,14 @@ def change_last_daily_entertainment_to_today(conn):
             sql = f"""
             UPDATE daily_entertainments
             SET journal_id = '{journal_result[0][0]}'
-            WHERE id = '{result[0][0]}';
+            WHERE id = '{result[0][0]}'
+            RETURNING *;
             """
             query(conn, sql)
             print('Move successful')
             show_last_10(conn)
 
-    elif input('Could not find it on yesterday, find the last one and move it instead? (y, n): ') == 'y':
+    elif yes_no_question('Could not find it on yesterday, find the last one and move it instead?'):
         sql = f"""
         SELECT de.id, j.id, j.date FROM daily_entertainments AS de
         INNER JOIN journals AS j ON j.id = de.journal_id
@@ -316,11 +318,12 @@ def change_last_daily_entertainment_to_today(conn):
         else:
             # List of row tuples to single row tuple
             latest_result = latest_result[0]
-            if input(f'The latest date is {latest_result[2]}, move it to today? (y, n): ') == 'y':
+            if yes_no_question(f'The latest date is {latest_result[2]}, move it to today?'):
                 sql = f"""
                 UPDATE daily_entertainments
                 SET journal_id = '{latest_result[1]}'
-                WHERE id = '{latest_result[0]}';.
+                WHERE id = '{latest_result[0]}'
+                RETURNING *;
                 """
                 query(conn, sql)
                 print('Move successful')
@@ -334,58 +337,82 @@ def print_query_table(results, cut=36):
     """
     printable = []
     for row in results:
-        printable.append([cell[:cut] + '...'  if isinstance(cell, str) and len(cell) > cut else cell for cell in row])
+        printable.append([cell[:cut] + '...'  if cut > 0 and isinstance(cell, str) and len(cell) > cut else cell for cell in row])
     print(tabulate(printable, headers='firstrow', tablefmt='simple_grid'))
+
+def yes_no_question(text: str) -> bool:
+    while True:
+        selection = input(f'{text} (y, n): ')
+        if selection.lower() == 'y':
+            return True
+        elif selection.lower() == 'n':
+            return False
+        else:
+            print('Invalid selection, try again!')
 
 if __name__ == '__main__':
     print('Starting...')
     config = load_config()
     print('Configs loadded')
-    conn = connect(config)
-    if not conn:
-        print('Could not connect to DB!')
-        exit()
+    sleep_period = 2
+    while True:
+        conn = connect(config)
+        if not conn:
+            print(f'Could not connect to DB! Will try again in {sleep_period} seconds...')
+            time.sleep(sleep_period)
+            sleep_period += 2
+        else:
+            print('Connected to DB')
+            break
     option = ''
 
     while option != '0':
-        print(tabulate([
-            (0, 'Exit'),
-            (1, 'Insert a gunluk'),
-            (2, 'Insert a gunluk with a custom date'),
-            (3, 'Insert an entertainment'),
-            (4, 'Find an entertainment'),
-            (5, 'Show last 10 with entertainment'),
-            (6, 'Custom query'),
-            (7, 'Move last entertainment to today'),
-            (8, 'Show journal text'),
-            ], tablefmt="rounded_outline"))
-        option = input('--> ')
+        try:
+            print(tabulate([
+                (0, 'Exit'),
+                (1, 'Insert a gunluk'),
+                (2, 'Insert a gunluk with a custom date'),
+                (3, 'Insert an entertainment'),
+                (4, 'Find an entertainment'),
+                (5, 'Show last 10 with entertainment'),
+                (6, 'Custom query'),
+                (7, 'Move last entertainment to today'),
+                (8, 'Show journal text'),
+                ], tablefmt="rounded_outline"))
+            option = input('--> ')
 
-        if option == '0':
-            break
-        elif option == '1':
-            insert_gunluk(conn)
-            show_last_10(conn)
-        elif option == '2':
-            insert_gunluk(conn, is_custom_date=True)
-            show_last_10(conn)
-        elif option == '3':
-            insert_entertainment(conn)
-        elif option == '4':
-            get_entertainment(conn)
-        elif option == '5':
-            show_last_10(conn)
-        elif option == '6':
-            q = input('Query: ')
-            r = query(conn, q, add_header=True)
-            if r:
-               print_query_table(r)
-        elif option == '7':
-            change_last_daily_entertainment_to_today(conn)
-        elif option == '8':
-            print(journal)
-        else:
-            print('ERROR: Invalid input')
+            if option == '0':
+                break
+            elif option == '1':
+                insert_gunluk(conn)
+                show_last_10(conn)
+            elif option == '2':
+                insert_gunluk(conn, is_custom_date=True)
+                show_last_10(conn)
+            elif option == '3':
+                insert_entertainment(conn)
+            elif option == '4':
+                get_entertainment(conn)
+            elif option == '5':
+                show_last_10(conn)
+            elif option == '6':
+                q = input('Query: ')
+                r = query(conn, q, add_header=True)
+                if r:
+                    # Only 1 column, ask the text cut length
+                    if len(r[0]) == 1:
+                        l = input('Table cut length (0 to skip): ')
+                        print_query_table(r, int(l))
+                    else:
+                        print_query_table(r)
+            elif option == '7':
+                change_last_daily_entertainment_to_today(conn)
+            elif option == '8':
+                print(journal)
+            else:
+                print('ERROR: Invalid input')
+        except Exception as e:
+            print(e)
 
     conn.close()
     print('Closed the postgres connection')
