@@ -16,7 +16,9 @@ _CONFIG_SECTION = 'postgresql'
 journal = ''
 
 # TV show duration regex pattern --> S1E10-S1E13
-TV_SERIES_REGEX_PATTERN = '^(S[1-9][0-9]*E[1-9][0-9]*-S[1-9][0-9]*E[1-9][0-9]*)$'
+TV_SERIES_REGEX_PATTERN = r'S([1-9]\d*)E([1-9]\d*)-S([1-9]\d*)E([1-9]\d*)'
+# Date regex
+DATE_REGEX = r'^\d{4}-\d{2}-\d{2}$'
 
 
 class EntertaintmentType(IntEnum):
@@ -40,6 +42,13 @@ class Happiness(IntEnum):
     BAYA_IYI = 8
     SAHANE = 9
     MUHTESEM = 10
+
+
+def set_cmd_window_size(cols, lines):
+    command = f'mode con: cols={cols} lines={lines}'
+    os.system(command)
+
+# --- DB CONNECTION --------------------------------------------
 
 def load_config(filename: str = _CONFIG_FILE, section: str = _CONFIG_SECTION) -> dict[str, str]:
     parser = ConfigParser()
@@ -71,7 +80,7 @@ def connect(config: dict[str, str]):
     except (psycopg2.DatabaseError, Exception) as error:
         print(error)
 
-def query(conn, sql, fetch=True, add_header=False):
+def query(conn, sql, fetch=True, add_header=False, count=0):
     try:
         conn.autocommit = True
         cursor = conn.cursor()
@@ -86,15 +95,28 @@ def query(conn, sql, fetch=True, add_header=False):
 
         if fetch:
             return results
+    except psycopg2.OperationalError:
+        # Try again with new conn, got lots of connection errors lately
+        count += 1
+        if count <= 5:
+            print(f'Trying again... #{count}')
+            query(connect(config), sql, fetch, add_header, count)
+        else:
+            print('Tried 5 times, stopped')
     except Exception as e:
         print(e)
+        # Maybe it works this time
+        if yes_no_question('Try again with a new connection?'):
+            query(connect(config), sql, fetch, add_header)
+
+# --- DB QUERY FUNCTIONS ---------------------------------------
 
 def insert_entertainment(conn):
     print(tabulate([(e.name, e.value) for e in EntertaintmentType], tablefmt="rounded_outline"))
 
     while True:
-        _type = input('Type: ')
-        if not _type.isdigit() or int(_type) not in iter(EntertaintmentType):
+        _type = typed_input('Type', [int])
+        if _type not in iter(EntertaintmentType):
             print('Invalid type!')
         else:
             break
@@ -103,7 +125,7 @@ def insert_entertainment(conn):
     sql = f"INSERT INTO entertainments (type, name, image_url) VALUES ({_type}, '{name}', '{url}');"
     query(conn, sql, fetch=False)
 
-def get_entertainment(conn) -> tuple[str, int]:
+def get_entertainment(conn, just_show: bool = False) -> tuple[str, int]:
     name = input('Name of the entertainment: ')
     sql = f"SELECT id, name, type FROM entertainments WHERE name ILIKE '%{name}%';"
     entertainments = query(conn, sql)
@@ -115,56 +137,25 @@ def get_entertainment(conn) -> tuple[str, int]:
     print('0- Nope/Exit')
     for index, ent in enumerate(entertainments):
         print('{i}- {name}'.format(i=index+1, name=ent[1]))
+
+    # Just to show the names, no inputs
+    if just_show:
+        return None, None
+    
     while True:
-        selected = input('Select: ')
-        if not selected.isdigit():
-            print('Invalid selection, must be int!')
-        selected = int(selected)
+        selected = typed_input('Select', [int])
         if selected < 0 or selected > len(entertainments):
             print('Invalid selection, try again')
-        elif selected == '0':
+            continue
+        elif selected == 0:
             return None, None
         else:
             # ID is the first item of the query (id, name)
-            selected_index = int(selected) - 1
-            selected_row = entertainments[selected_index]
+            selected_row = entertainments[selected - 1]
             return selected_row[0], selected_row[2]
 
-def insert_gunluk(conn, is_custom_date = False):
-    print(tabulate([(e.name, e.value) for e in Happiness], tablefmt="rounded_outline"))
-
-    # Ewww!
-    while True:
-        work_happiness = input('Work happiness: ')
-        if not work_happiness.isdigit() or int(work_happiness) not in iter(Happiness):
-            print('Invalid happiness!')
-        else:
-            break
-    while True:
-        daily_happiness = input('Daily (outside work) happiness: ')
-        if not daily_happiness.isdigit() or int(daily_happiness) not in iter(Happiness):
-            print('Invalid happiness!')
-        else:
-            break
-    while True:
-        total_happiness = input('Total happiness: ')
-        if not total_happiness.isdigit() or int(total_happiness) not in iter(Happiness):
-            print('Invalid happiness!')
-        else:
-            break
-
-    _temp_journal = ''
-    while True:
-        _temp_journal += input('Journal: ')
-        # Ask if it's completed or accidently pressed the Enter button
-        if yes_no_question('Is it done?'):
-            # Query needs double quote --> ''
-            journal = _temp_journal.replace('\'', '\'\'')
-            break
-        elif yes_no_question('Reset the written text?'):
-            _temp_journal = ''
-
-    # Insert daily entertainments
+def add_daily_entertainments() -> list[tuple[str, str, str]]:
+    # Daily entertainments to insert
     daily_entertainments = []
     while True:
         if not yes_no_question('Add entertainment?'):
@@ -181,40 +172,120 @@ def insert_gunluk(conn, is_custom_date = False):
                 LIMIT 1;
                 """
                 last_duration = query(conn, duration_sql)
-                to_show = None
                 # Make it easy to add a duration for a TV show
                 if last_duration and len(last_duration):
                     # It's a list of tuple: [('S1E10-S1E10',)]
                     last_duration = last_duration[0][0]
+                    # Parse its numbers
+                    match = re.match(TV_SERIES_REGEX_PATTERN, last_duration)
+                    if match:
+                        season_start = int(match.group(1))
+                        episode_start = int(match.group(2))
+                        season_end = int(match.group(3))
+                        episode_end = int(match.group(4))
+                    else:
+                        print(f'[ERROR] Duration parse error for {last_duration}')
+                        continue
+
                     # If the season is the same, just get the last episode number
                     if yes_no_question('Same season?'):
-                        initial, last = last_duration.split('-')
-                        # Fint the initial and last 'E', and get the numbers index (+1)
-                        initial_episode_index = initial.rfind('E') + 1
-                        last_episode_index = last.rfind('E') + 1
-                        # Find the last episode number and increase it by 1
-                        new_episode = int(last[last_episode_index:]) + 1
-                        # Construct the final string ==> S5E14-S5E17 ==> S5E + 18 + - + S5E + [INPUT]
-                        to_show = f'{initial[:initial_episode_index]}{new_episode}-{last[:last_episode_index]}'
-                        duration = to_show + input('Duration: ' + to_show)
+                        number_of_episodes = typed_input('How many episodes?', [int])
+                        # If it's just 1 episode, start and end numbers should match, that's why we need a -1 at the end
+                        duration = f'S{season_end}E{episode_end}-S{season_end}E{episode_end + number_of_episodes - 1}'
+                    elif yes_no_question('Next season?'):
+                        number_of_episodes = typed_input('How many episodes (from episode 1)?', [int])
+                        # If it's just 1 episode, should be like S4E15-S5E1
+                        duration = f'S{season_end}E{episode_end}-S{season_end + 1}E{number_of_episodes}'
                     else:
-                        # TODO get the last session, +1, use E1
-                        print(f'Last duration: {last_duration}')
-                # Skip this if it's already filled
-                if to_show is None:
-                    duration = input('Duration: ')
+                        duration = input(f'Last duration: {last_duration}, enter duration: ')
+                # No last duration
+                elif yes_no_question('New series?'):
+                    number_of_episodes = typed_input('How many episodes (from session 1 episode 1)?', [int])
+                    # If it's just 1 episode, should be like S1E1-S1E1
+                    duration = f'S1E1-S1E{number_of_episodes}'
+                # Something custom I guess
+                else:
+                    duration = input('Custom duration: ')
+
                 # Validate duration for TV shows
                 if re.match(TV_SERIES_REGEX_PATTERN, duration) is None:
                     print('Invalid TV Series duration, skipping...')
                     continue
             else:
-                duration = input('Duration: ')
+                # TODO convert hour duration to minutes at some point. Needs a DB migration as well!
+                duration = typed_input('Duration', [int, float])
+            
+            print(f'Duration: {duration}')
             daily_entertainments.append(f"((SELECT id FROM new_journal), '{e_id}', '{duration}')")
+    return daily_entertainments
+
+def insert_gunluk(conn, is_custom_date = False):
+    print(tabulate([(e.name, e.value) for e in Happiness], tablefmt="rounded_outline"))
+
+    # Ewww!
+    while True:
+        work_happiness = typed_input('Work happiness', [int])
+        if work_happiness not in iter(Happiness):
+            print('Invalid happiness!')
+        else:
+            break
+    while True:
+        daily_happiness = typed_input('Daily (outside work) happiness', [int])
+        if daily_happiness not in iter(Happiness):
+            print('Invalid happiness!')
+        else:
+            break
+    while True:
+        total_happiness = typed_input('Total happiness', [int])
+        if total_happiness not in iter(Happiness):
+            print('Invalid happiness!')
+        else:
+            break
+
+    _temp_journal = ''
+    _journal_input_msg = 'Journal: '
+    while True:
+        _temp_journal += input(_journal_input_msg)
+        # Ask if it's completed or accidently pressed the Enter button
+        if yes_no_question('Is it done?'):
+            # Query needs double quote --> ''
+            journal = _temp_journal.replace('\'', '\'\'')
+            break
+        elif yes_no_question('Reset the written text?'):
+            _temp_journal = ''
+        else:
+            # Add the last entry to the input msg, so I can continue writing it seamlessly
+            _journal_input_msg += _temp_journal
+
+    # Get daily entertainments
+    daily_entertainments = add_daily_entertainments()
+    # Remove incorrect ones
+    if yes_no_question('Remove any daily entertainments before insert?'):
+        while True:
+            try:
+                if not daily_entertainments:
+                    print('No daily entertainments')
+                    break
+                [print(f'{i}: {de}') for i, de in enumerate(daily_entertainments)]
+                remove_index = typed_input('Enter an index to remove, <0 to exit', [int])
+                if remove_index < 0:
+                    break
+                del daily_entertainments[remove_index]
+                print(f'Index {remove_index} removed')
+            except Exception as e:
+                print(f'[ERROR] {e}')
+                continue
 
     if is_custom_date:
-        query_date = input('Journal date (YYYY-MM-DD): ')
-        # Add quotes for timestamp to text casting
-        query_date = "'" + query_date + "'"
+        while True:
+            query_date = input('Journal date (YYYY-MM-DD): ')
+            # Check validity
+            if re.match(DATE_REGEX, query_date):
+                # Add quotes for timestamp to text casting
+                query_date = "'" + query_date + "'"
+                break
+            else:
+                print('Invalid date!')
     else:
         # Adjust the date
         current_hour = datetime.now().hour
@@ -329,6 +400,8 @@ def change_last_daily_entertainment_to_today(conn):
                 print('Move successful')
                 show_last_10(conn)
 
+# --- INPUT/OUTPUT ---------------------------------------------
+
 def print_query_table(results, cut=36):
     """
     Trims the long column data and print results as table (with the first row being the header)
@@ -342,15 +415,31 @@ def print_query_table(results, cut=36):
 
 def yes_no_question(text: str) -> bool:
     while True:
-        selection = input(f'{text} (y, n): ')
+        selection = input(f'{text} [y/n]: ')
         if selection.lower() == 'y':
             return True
         elif selection.lower() == 'n':
             return False
         else:
-            print('Invalid selection, try again!')
+            print('[ERROR] Invalid selection, try again')
 
-if __name__ == '__main__':
+def typed_input(msg: str, types: list[type]):
+    # TODO accept and handle enums as well!
+    while True:
+        _input = input(f'{msg}: ')
+        for _type in types:
+            try:
+                return _type(_input)
+            except:
+                pass
+        print('[ERROR] Invalid input type, try again')
+
+# --- MAIN -----------------------------------------------------
+
+if __name__ == '__main__':    
+    # Set the window size (adjust as needed)
+    set_cmd_window_size(150, 75)
+
     print('Starting...')
     config = load_config()
     print('Configs loadded')
@@ -379,38 +468,39 @@ if __name__ == '__main__':
                 (7, 'Move last entertainment to today'),
                 (8, 'Show journal text'),
                 ], tablefmt="rounded_outline"))
-            option = input('--> ')
+            option = typed_input('--> ', [int])
 
-            if option == '0':
-                break
-            elif option == '1':
-                insert_gunluk(conn)
-                show_last_10(conn)
-            elif option == '2':
-                insert_gunluk(conn, is_custom_date=True)
-                show_last_10(conn)
-            elif option == '3':
-                insert_entertainment(conn)
-            elif option == '4':
-                get_entertainment(conn)
-            elif option == '5':
-                show_last_10(conn)
-            elif option == '6':
-                q = input('Query: ')
-                r = query(conn, q, add_header=True)
-                if r:
-                    # Only 1 column, ask the text cut length
-                    if len(r[0]) == 1:
-                        l = input('Table cut length (0 to skip): ')
-                        print_query_table(r, int(l))
-                    else:
-                        print_query_table(r)
-            elif option == '7':
-                change_last_daily_entertainment_to_today(conn)
-            elif option == '8':
-                print(journal)
-            else:
-                print('ERROR: Invalid input')
+            match option:
+                case 0:
+                    break
+                case 1:
+                    insert_gunluk(conn)
+                    show_last_10(conn)
+                case 2:
+                    insert_gunluk(conn, is_custom_date=True)
+                    show_last_10(conn)
+                case 3:
+                    insert_entertainment(conn)
+                case 4:
+                    get_entertainment(conn, just_show=True)
+                case 5:
+                    show_last_10(conn)
+                case 6:
+                    q = input('Query: ')
+                    r = query(conn, q, add_header=True)
+                    if r:
+                        # Only 1 column, ask the text cut length
+                        if len(r[0]) == 1:
+                            l = input('Table cut length (0 to skip): ')
+                            print_query_table(r, int(l))
+                        else:
+                            print_query_table(r)
+                case 7:
+                    change_last_daily_entertainment_to_today(conn)
+                case 8:
+                    print(journal)
+                case _:
+                    print('[ERROR] Invalid input number (0-8)')
         except Exception as e:
             print(e)
 
