@@ -1,7 +1,9 @@
 import os
 import psycopg2
 import re
+import readline
 import time
+import traceback
 from configparser import ConfigParser
 from enum import IntEnum
 from datetime import datetime, timedelta
@@ -14,6 +16,8 @@ _CONFIG_SECTION = 'postgresql'
 # TODO encrypt the journal text
 # Store the journal text globally, just in case it gets lost
 journal = ''
+# Table names for auto complete
+table_names = []
 
 # TV show duration regex pattern --> S1E10-S1E13
 TV_SERIES_REGEX_PATTERN = r'S([1-9]\d*)E([1-9]\d*)-S([1-9]\d*)E([1-9]\d*)'
@@ -73,7 +77,7 @@ def connect(config: dict[str, str]):
             database=config['database'],
             user=config['user'],
             password=config['password'],
-            #connect_timeout=10
+            connect_timeout=10
         ) as conn:
             print('Connected to the PostgreSQL server.')
             return conn
@@ -103,8 +107,8 @@ def query(conn, sql, fetch=True, add_header=False, count=0):
             query(connect(config), sql, fetch, add_header, count)
         else:
             print('Tried 5 times, stopped')
-    except Exception as e:
-        print(e)
+    except Exception:
+        traceback.print_exc()
         # Maybe it works this time
         if yes_no_question('Try again with a new connection?'):
             query(connect(config), sql, fetch, add_header)
@@ -190,12 +194,12 @@ def add_daily_entertainments() -> list[tuple[str, str, str]]:
                     # If the season is the same, just get the last episode number
                     if yes_no_question('Same season?'):
                         number_of_episodes = typed_input('How many episodes?', [int])
-                        # If it's just 1 episode, start and end numbers should match, that's why we need a -1 at the end
-                        duration = f'S{season_end}E{episode_end}-S{season_end}E{episode_end + number_of_episodes - 1}'
+                        # If it's just 1 episode, start and end numbers should match
+                        duration = f'S{season_end}E{episode_end + 1}-S{season_end}E{episode_end + number_of_episodes}'
                     elif yes_no_question('Next season?'):
                         number_of_episodes = typed_input('How many episodes (from episode 1)?', [int])
-                        # If it's just 1 episode, should be like S4E15-S5E1
-                        duration = f'S{season_end}E{episode_end}-S{season_end + 1}E{number_of_episodes}'
+                        # If it's just 1 episode, should be like S5E1-S5E1
+                        duration = f'S{season_end + 1}E1-S{season_end + 1}E{number_of_episodes}'
                     else:
                         duration = input(f'Last duration: {last_duration}, enter duration: ')
                 # No last duration
@@ -245,6 +249,7 @@ def insert_gunluk(conn, is_custom_date = False):
     _temp_journal = ''
     _journal_input_msg = 'Journal: '
     while True:
+        # TODO encyrpt the journal text!!!
         _temp_journal += input(_journal_input_msg)
         # Ask if it's completed or accidently pressed the Enter button
         if yes_no_question('Is it done?'):
@@ -434,6 +439,55 @@ def typed_input(msg: str, types: list[type]):
                 pass
         print('[ERROR] Invalid input type, try again')
 
+def custom_query(conn):
+    # Get all table names for auto complete
+    global table_names
+    if not table_names:
+        table_sql = "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public';"
+        table_names = query(conn, table_sql)
+
+        if table_names:
+            # Extract names from row tuples
+            table_names = [x[0] for x in table_names]
+            # Function for readline to use
+            def completer(text, state):
+                options = [table_name for table_name in table_names if table_name.startswith(text)]
+                if state < len(options):
+                    return options[state]
+                else:
+                    return None
+            # Configure readline to use the completer function
+            readline.set_completer(completer)
+            readline.parse_and_bind('tab: complete')
+        else:
+            print('[WARNING] Could not get the table names, auto complete is not available')
+
+    sql = input('Query: ')
+
+    # Prevent UPDATE/DELETE without a WHERE condition!!!
+    if any(x.upper() in sql.upper() for x in ['UPDATE', 'DELETE']) and 'WHERE' not in sql.upper():
+        print('--- WARNING! ---\nDetected an UPDATE/DELETE query without a condition!')
+        return
+
+    # Handle None type update/insert returns
+    if any(x.upper() in sql.upper() for x in ['INSERT', 'UPDATE', 'DELETE']) and 'RETURNING' not in sql.upper():
+        # Add returning at the end of the query
+        sql = sql.replace(';', '')
+        sql += ' RETURNING *;'
+
+    # Handle the last missing semi colon
+    if sql[-1] != ';':
+        sql += ';'
+
+    r = query(conn, sql, add_header=True)
+    if r:
+        # Only 1 column, ask the text cut length
+        if len(r[0]) == 1:
+            l = input('Table cut length (0 to skip): ')
+            print_query_table(r, int(l))
+        else:
+            print_query_table(r)
+
 # --- MAIN -----------------------------------------------------
 
 if __name__ == '__main__':    
@@ -486,15 +540,7 @@ if __name__ == '__main__':
                 case 5:
                     show_last_10(conn)
                 case 6:
-                    q = input('Query: ')
-                    r = query(conn, q, add_header=True)
-                    if r:
-                        # Only 1 column, ask the text cut length
-                        if len(r[0]) == 1:
-                            l = input('Table cut length (0 to skip): ')
-                            print_query_table(r, int(l))
-                        else:
-                            print_query_table(r)
+                    custom_query(conn)
                 case 7:
                     change_last_daily_entertainment_to_today(conn)
                 case 8:
