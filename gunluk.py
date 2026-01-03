@@ -84,12 +84,28 @@ def connect(config: dict[str, str]):
     except (psycopg2.DatabaseError, Exception) as error:
         print(error)
 
-def query(conn, sql, fetch=True, add_header=False, count=0):
+def query(conn, sql: str, values: tuple = None, fetch: bool = True, add_header: bool = False, times: int = 0):
+    """
+    Executes a SQL query with or without parameters, and returns results if applicable.
+
+    :param conn: Database connection object.
+    :param sql: SQL query string.
+    :param values: Tuple or list of values to substitute into the SQL query (default is None).
+    :param fetch: Whether to fetch results (default is True).
+    :param add_header: Whether to add headers to the result (default is False).
+    :param times: Times to re-try running the same query (default is 0).
+    :return: Results of the query if fetch=True, otherwise None.
+    """
     try:
         conn.autocommit = True
         cursor = conn.cursor()
 
-        cursor.execute(sql)
+        # Execute the query with or without parameters (values)
+        if values:
+            cursor.execute(sql, values)
+        else:
+            cursor.execute(sql)
+
         if fetch:
             results = [[desc[0] for desc in cursor.description]] if add_header else []
             results.extend(cursor.fetchall())
@@ -102,20 +118,20 @@ def query(conn, sql, fetch=True, add_header=False, count=0):
     except psycopg2.OperationalError:
         # Try again with new conn, got lots of connection errors lately
         count += 1
-        if count <= 5:
+        if count <= times:
             print(f'Trying again... #{count}')
-            query(connect(config), sql, fetch, add_header, count)
+            query(connect(config), sql, values, fetch, add_header, count)
         else:
-            print('Tried 5 times, stopped')
+            print(f'Tried {times} times, stopped')
     except Exception:
         traceback.print_exc()
         # Maybe it works this time
         if yes_no_question('Try again with a new connection?'):
-            query(connect(config), sql, fetch, add_header)
+            query(connect(config), sql, values, fetch, add_header)
 
 # --- DB QUERY FUNCTIONS ---------------------------------------
 
-def insert_entertainment(conn):
+def insert_entertainment(conn) -> tuple[str, int]:
     print(tabulate([(e.name, e.value) for e in EntertaintmentType], tablefmt="rounded_outline"))
 
     while True:
@@ -126,13 +142,22 @@ def insert_entertainment(conn):
             break
     name = input('Name: ')
     url = input('Image URL: ')
-    sql = f"INSERT INTO entertainments (type, name, image_url) VALUES ({_type}, '{name}', '{url}');"
-    query(conn, sql, fetch=False)
+    sql = f"INSERT INTO entertainments (type, name, image_url) VALUES (%s, %s, %s) RETURNING (id, name, type)"
+    values = (_type, name, url)
+    inserted = query(conn, sql, values=values, fetch=True)
+    if inserted and len(inserted) > 0:
+        e_id, e_name, e_type = inserted[0]
+        print(f'Inserted: {e_name} ({e_id})')
+        return e_id, e_type
+    else:
+        print(f'Failed to insert {name}')
+        return None, None
 
 def get_entertainment(conn, just_show: bool = False) -> tuple[str, int]:
     name = input('Name of the entertainment: ')
-    sql = f"SELECT id, name, type FROM entertainments WHERE name ILIKE '%{name}%';"
-    entertainments = query(conn, sql)
+    sql = f"SELECT id, name, type FROM entertainments WHERE name ILIKE %s"
+    values = (f'%{name}%', )
+    entertainments = query(conn, sql, values=values)
     if not entertainments or len(entertainments) == 0:
         print('Could not find any entertainments with that name')
         return None, None
@@ -140,7 +165,7 @@ def get_entertainment(conn, just_show: bool = False) -> tuple[str, int]:
     # Print option and return the selected ones ID
     print('0- Nope/Exit')
     for index, ent in enumerate(entertainments):
-        print('{i}- {name}'.format(i=index+1, name=ent[1]))
+        print(f'{index+1}- {ent[1]} ({ent[0]})')
 
     # Just to show the names, no inputs
     if just_show:
@@ -165,17 +190,23 @@ def add_daily_entertainments() -> list[tuple[str, str, str]]:
         if not yes_no_question('Add entertainment?'):
             break
         e_id, e_type = get_entertainment(conn=conn)
+
+        # Try to insert a new entertainment
+        if not e_id and yes_no_question('Insert entertainment?'):
+            e_id, e_type = insert_entertainment(conn=conn)
+
         if e_id:
             # It's a TV series, find the last duration
             if e_type == EntertaintmentType.SERIES:
                 duration_sql = f"""
                 SELECT duration
                 FROM daily_entertainments
-                WHERE entertainment_id='{e_id}'
+                WHERE entertainment_id = %s
                 ORDER BY date_created DESC
                 LIMIT 1;
                 """
-                last_duration = query(conn, duration_sql)
+                values = (e_id, )
+                last_duration = query(conn, sql=duration_sql, values=values)
                 # Make it easy to add a duration for a TV show
                 if last_duration and len(last_duration):
                     # It's a list of tuple: [('S1E10-S1E10',)]
@@ -253,19 +284,18 @@ def insert_gunluk(conn, is_custom_date = False):
         _temp_journal += input(_journal_input_msg)
         # Ask if it's completed or accidently pressed the Enter button
         if yes_no_question('Is it done?'):
-            # Query needs double quote --> ''
-            journal = _temp_journal.replace('\'', '\'\'')
+            journal = _temp_journal
             break
         elif yes_no_question('Reset the written text?'):
             _temp_journal = ''
         else:
             # Add the last entry to the input msg, so I can continue writing it seamlessly
-            _journal_input_msg += _temp_journal
+            _journal_input_msg = 'Journal: ' + _temp_journal
 
     # Get daily entertainments
     daily_entertainments = add_daily_entertainments()
     # Remove incorrect ones
-    if yes_no_question('Remove any daily entertainments before insert?'):
+    if daily_entertainments and yes_no_question('Remove any daily entertainments before insert?'):
         while True:
             try:
                 if not daily_entertainments:
@@ -283,9 +313,19 @@ def insert_gunluk(conn, is_custom_date = False):
 
     if is_custom_date:
         while True:
-            query_date = input('Journal date (YYYY-MM-DD): ')
+            if yes_no_question('Yesterday?'):
+                today = datetime.today()
+                yesterday = today - timedelta(days=1)
+                query_date = yesterday.strftime('%Y-%m-%d')
+            else:
+                query_date = input('Journal date (YYYY-MM-DD): ')
             # Check validity
             if re.match(DATE_REGEX, query_date):
+                # Check if it's the correct year or not!
+                # Parse the date string into a datetime object
+                date = datetime.strptime(query_date, '%Y-%m-%d')
+                if date.year != datetime.now().year:
+                    print('This does not seem to be current year!? You good?')
                 # Add quotes for timestamp to text casting
                 query_date = "'" + query_date + "'"
                 break
@@ -308,35 +348,39 @@ def insert_gunluk(conn, is_custom_date = False):
     journal_sql = f"""
     INSERT INTO journals
     (user_id, date, work_happiness, daily_happiness, total_happiness, content)
-    VALUES(
-        '699082b4-1821-4b46-af07-2df20fc41c5f',
-        {query_date},
-        {work_happiness},
-        {daily_happiness},
-        {total_happiness},
-        '{journal}'
-    )
+    VALUES(%s, %s, %s, %s, %s, %s)
     RETURNING id
     """
+    journal_values = ('699082b4-1821-4b46-af07-2df20fc41c5f', query_date, work_happiness, daily_happiness, total_happiness, journal)
 
-    sql = journal_sql if not daily_entertainments else f"""
-    WITH new_journal AS ({journal_sql})
+    if daily_entertainments:
+        # Construct the final SQL query for inserting data
+        # Prepare the INSERT INTO statement dynamically using placeholders
+        placeholders = ', '.join(['%s'] * len(daily_entertainments))  # %s placeholders for each tuple
 
-    INSERT INTO daily_entertainments
-    (journal_id, entertainment_id, duration)
-    VALUES {', '.join(daily_entertainments)}
-    """
-    # Finish the query
-    sql += ';'
+        sql = f"""
+        WITH new_journal AS ({journal_sql})
+        INSERT INTO daily_entertainments
+        (journal_id, entertainment_id, duration)
+        VALUES {placeholders}
+        """
 
-    query(conn, sql, fetch=False)
+        # Flatten the daily_entertainments list to pass as values to the execute method
+        flattened_values = [item for sublist in daily_entertainments for item in sublist]
+        # Combine journal values and flattened daily_entertainments values
+        values = journal_values + tuple(flattened_values)
+    else:
+        sql = journal_sql
+        values = journal_values
+
+    query(conn, sql, values=values, fetch=False)
 
 def show_last_10(conn):
     sql = """
     SELECT date, work_happiness, daily_happiness, total_happiness, content, name, duration, type
     FROM daily_entertainments AS d
-    RIGHT JOIN journals AS j ON j.id=d.journal_id
-    LEFT JOIN entertainments AS e ON e.id=d.entertainment_id
+    RIGHT JOIN journals AS j ON j.id = d.journal_id
+    LEFT JOIN entertainments AS e ON e.id = d.entertainment_id
     ORDER BY date DESC LIMIT 10;
     """
     results = query(conn, sql, add_header=True)
@@ -349,45 +393,50 @@ def change_last_daily_entertainment_to_today(conn):
         e_id, _type = get_entertainment(conn=conn)
 
     today = datetime.strftime(datetime.now(), '%Y-%m-%d')
+    sql = f"""
+    SELECT id, date FROM journals
+    WHERE date::TEXT ILIKE %s
+    """
+    values = (f'%{today}%', )
+    journal_result = query(conn, sql, values)
+    # Check if today's journal isn't there
+    if not journal_result or len(journal_result) == 0:
+        print('Could not find today\'s journal')
+        return
+
     # First try to find it on yesterday's journal
     yesterday = datetime.now() - timedelta(days=1)
     yesterday = datetime.strftime(yesterday, '%Y-%m-%d')
     sql = f"""
     SELECT de.id FROM daily_entertainments AS de
     INNER JOIN journals AS j ON j.id = de.journal_id
-    WHERE entertainment_id = '{e_id}' AND j.date::TEXT LIKE '%{yesterday}%';
+    WHERE entertainment_id = %s AND j.date::TEXT ILIKE %s
     """
-    result = query(conn, sql)
+    values = (e_id, f'%{yesterday}%')
+    result = query(conn, sql, values)
 
     if result and len(result) > 0:
         sql = f"""
-        SELECT id, date FROM journals
-        WHERE date::TEXT LIKE '%{today}%';
+        UPDATE daily_entertainments
+        SET journal_id = %s
+        WHERE id = %s
+        RETURNING *
         """
-        journal_result = query(conn, sql)
-        # Check if today's journal isn't there
-        if not journal_result or len(journal_result) == 0:
-            print('Could not find today\'s journal')
-        else:
-            sql = f"""
-            UPDATE daily_entertainments
-            SET journal_id = '{journal_result[0][0]}'
-            WHERE id = '{result[0][0]}'
-            RETURNING *;
-            """
-            query(conn, sql)
-            print('Move successful')
-            show_last_10(conn)
+        values = (journal_result[0][0], result[0][0])
+        query(conn, sql, values)
+        print('Move successful')
+        show_last_10(conn)
 
     elif yes_no_question('Could not find it on yesterday, find the last one and move it instead?'):
         sql = f"""
         SELECT de.id, j.id, j.date FROM daily_entertainments AS de
         INNER JOIN journals AS j ON j.id = de.journal_id
         INNER JOIN entertainments AS e ON e.id = de.entertainment_id
-        WHERE entertainment_id = '{e_id}'
-        ORDER BY j.date DESC LIMIT 1';
+        WHERE entertainment_id = %s
+        ORDER BY j.date DESC LIMIT 1;
         """
-        latest_result = query(conn, sql)
+        values = (e_id, )
+        latest_result = query(conn, sql, values)
         # Check if latest journal isn't there
         if not latest_result and len(latest_result) == 0:
             print('Could not find any latest journal')
@@ -397,13 +446,86 @@ def change_last_daily_entertainment_to_today(conn):
             if yes_no_question(f'The latest date is {latest_result[2]}, move it to today?'):
                 sql = f"""
                 UPDATE daily_entertainments
-                SET journal_id = '{latest_result[1]}'
-                WHERE id = '{latest_result[0]}'
-                RETURNING *;
+                SET journal_id = %s
+                WHERE id = %s
+                RETURNING *
                 """
-                query(conn, sql)
+                values = (journal_result[0][0], latest_result[0])
+                query(conn, sql, values)
                 print('Move successful')
                 show_last_10(conn)
+
+def get_last_weeks_journals_and_show_missing(conn):
+    try:
+        sql = """
+        WITH date_series AS (
+            SELECT generate_series(
+                current_date - interval '6 days', 
+                current_date - interval '1 day',
+                interval '1 day'
+            ) AS date
+        ),
+        date_entries AS (
+            SELECT DISTINCT date::date
+            FROM journals
+            WHERE date >= current_date - interval '6 days'
+        )
+        SELECT date_series.date
+        FROM date_series
+        LEFT JOIN date_entries
+        ON date_series.date = date_entries.date
+        WHERE date_entries.date IS NULL;
+        """
+        results = query(conn, sql, add_header=True)
+        missing_dates = [x[0].date().isoformat() for x in results[1:]]
+        if missing_dates:
+            print('*********************************** -->')
+            print(f'[WARNING] These dates are missing: {", ".join(missing_dates)}')
+            print('*********************************** -->')
+    except Exception:
+        print('[ERROR] Failed to check the missing journals!')
+
+def get_daily_entertainment(conn, just_show: bool = False) -> tuple[str, str, str, str]:
+    journal_date = input('Journal date: ')
+    sql = f"""
+        SELECT de.id, de.journal_id, de.entertainment_id, de.duration, j.date, e.name, e.type
+        FROM daily_entertainments AS de
+        INNER JOIN journals AS j
+            ON de.journal_id = j.id
+        INNER JOIN entertainments AS e
+            ON de.entertainment_id = e.id
+        WHERE j.date::TEXT ILIKE %s
+    """
+    values = (f'%{journal_date}%', )
+    daily_entertainments = query(conn, sql, values=values)
+    if not daily_entertainments or len(daily_entertainments) == 0:
+        print('Could not find any daily entertainments with that date')
+        return None, None, None, None
+
+    # Print option and return the selected ones ID
+    print_rows = [
+        ('Index', 'Entertainment Name', 'Journal Date', 'Daily Entertainment ID'),
+        (0, 'Nope/Exit')
+        ]
+    for index, de in enumerate(daily_entertainments):
+        print_rows.append((index+1, de[5], de[4], de[0]))
+    print_query_table(print_rows)
+
+    # Just to show the names, no inputs
+    if just_show:
+        return None, None, None, None
+
+    while True:
+        selected = typed_input('Select', [int])
+        if selected < 0 or selected > len(daily_entertainments):
+            print('Invalid selection, try again')
+            continue
+        elif selected == 0:
+            return None, None, None, None
+        else:
+            # Only return the daily_entertainment columns as (id, journal_id, entertainment_id, duration)
+            selected_row = daily_entertainments[selected - 1]
+            return selected_row[0], selected_row[1], selected_row[2], selected_row[3]
 
 # --- INPUT/OUTPUT ---------------------------------------------
 
@@ -489,10 +611,12 @@ def custom_query(conn):
             print_query_table(r)
 
 # --- MAIN -----------------------------------------------------
+# TODO list
+#  - set_cmd_window_size(150, 75) doesn't work on W11 cmd window!
 
 if __name__ == '__main__':    
     # Set the window size (adjust as needed)
-    set_cmd_window_size(150, 75)
+    # TODO W11 doesn't work set_cmd_window_size(150, 75)
 
     print('Starting...')
     config = load_config()
@@ -508,6 +632,9 @@ if __name__ == '__main__':
             print('Connected to DB')
             break
     option = ''
+    
+    # Check if I missed to write any previos days' journals
+    get_last_weeks_journals_and_show_missing(conn)
 
     while option != '0':
         try:
@@ -521,6 +648,7 @@ if __name__ == '__main__':
                 (6, 'Custom query'),
                 (7, 'Move last entertainment to today'),
                 (8, 'Show journal text'),
+                (9, 'Find daily entertainment'),
                 ], tablefmt="rounded_outline"))
             option = typed_input('--> ', [int])
 
@@ -545,6 +673,8 @@ if __name__ == '__main__':
                     change_last_daily_entertainment_to_today(conn)
                 case 8:
                     print(journal)
+                case 9:
+                    get_daily_entertainment(conn, just_show=True)
                 case _:
                     print('[ERROR] Invalid input number (0-8)')
         except Exception as e:
